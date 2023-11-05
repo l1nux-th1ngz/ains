@@ -1,293 +1,205 @@
 #!/bin/bash
-# My Hyprland Testing Script
 
-# Define an array of ANSI color codes for random colors
-colors=("$(tput setaf 1)" "$(tput setaf 2)" "$(tput setaf 3)" "$(tput setaf 4)" "$(tput setaf 5)" "$(tput setaf 6)" "$(tput setaf 7)" "$(tput setaf 8)" "$(tput setaf 9)" "$(tput setaf 10)")
-
-# Function to get a random color
-get_random_color() {
-    local num_colors=${#colors[@]}
-    local random_index=$((RANDOM % num_colors))
-    echo "${colors[$random_index]}"
-}
-
-# Set the colors for each section
-OK="$(get_random_color)[OK]$(tput sgr0)"
-ERROR="$(get_random_color)[ERROR]$(tput sgr0)"
-NOTE="$(get_random_color)[NOTE]$(tput sgr0)"
-WARN="$(get_random_color)[WARN]$(tput sgr0)"
-CAT="$(get_random_color)[ACTION]$(tput sgr0)"
-
-# Function to install packages and show status
-install_and_display_status() {
-    local package_name="$1"
-    local category="$2"
-
-    local random_color="$(get_random_color)"
-    printf "%s Installing %s: %s\n" "$random_color" "$category" "$package_name"
-    install_package "$package_name" 2>&1 | tee -a $LOG
-
-    if [ $? -ne 0 ]; then
-        printf "\e[1A\e[K%s - %s install had failed, please check the install.log\n" "${ERROR}" "$package_name"
-        exit 1
-    fi
-}
-
-# Function for installing packages
-install_package() {
-    # Check if the package is already installed
-    if $ISAUR -Q $1 &>> /dev/null ; then
-        echo -e "${OK} $1 is already installed. Skipping..."
-    else
-        # Package not installed
-        echo -e "${NOTE} Installing $1 ..."
-        $ISAUR -S --noconfirm $1 2>&1 | tee -a $LOG
-        # Make sure the package is installed
-        if $ISAUR -Q $1 &>> /dev/null ; then
-            echo -e "\e[1A\e[K${OK} $1 was installed."
-        else
-            # Something is missing, exit to review log
-            echo -e "\e[1A\e[K${ERROR} $1 failed to install, please check the install.log. You may need to install it manually."
-            exit 1
-        fi
-    fi
-}
-
-# Clear the screen
 clear
+echo -ne "
+-------------------------------------
+Yes, I definitely know what I'm doing
+-------------------------------------
+"
+# Making downloads faster
+pacman --noconfirm -Sy reflector
+reflector --latest 20 --sort rate --save /etc/pacman.d/mirrorlist --protocol https --download-timeout 5
+sed -i "s/^#ParallelDownloads = 5$/ParallelDownloads = 15/" /etc/pacman.conf
+pacman --noconfirm -Sy archlinux-keyring
 
-# Print password warning message
-printf "\n${YELLOW} Some commands require you to enter your password to execute. If you are worried about entering your password, you can cancel the script now with CTRL+C and review the script contents.${RESET}\n"
-sleep 2
-printf "\n\n"
+# Setting keymap and time stuff
+loadkeys us
+timedatectl set-ntp true
 
-# Ask the user if they want to proceed
-read -n1 -rep "${CAT} Do you want to install (y/n) " PROCEED
-echo
-if [[ $PROCEED =~ ^[Yy]$ ]]; then
-    printf "\n%s Let's Start.\n" "${OK}"
+# Drive selection
+clear
+lsblk
+echo -ne "Drive to install to: "
+read -r drive
+cfdisk "$drive"
+
+# Partition slection
+clear
+lsblk "$drive"
+
+echo -ne "Enter EFI partition: "
+read -r efipartition
+
+read -r -p "Should we format the EFI partition? [y/n]: " answer
+if [[ $answer = y ]]; then
+    echo "There it goes then"
+    mkfs.fat -F 32 "$efipartition"
 else
-    printf "\n%s No changes made to your system. Exiting Now.\n" "${NOTE}"
-    exit
+    echo "Alright, skipping EFI partition formatting"
 fi
 
-# Clear the screen
+echo -ne "Enter swap partition: "
+read -r swappartition
+mkswap "$swappartition"
+
+echo -ne "Enter root/home partition: "
+read -r rootpartition
+mkfs.ext4 "$rootpartition"
+
+# Mounting filesystems
+mount "$rootpartition" /mnt
+mkdir -p /mnt/boot
+mount "$efipartition" /mnt/boot
+swapon "$swappartition"
+
+# Initial Install
+pacstrap /mnt base base-devel linux linux-firmware
+genfstab -U /mnt > /mnt/etc/fstab
+
+# Moving the rest of the script to the install and chrooting
+sed '1,/^###part2$/d' install.sh > /mnt/install2.sh
+chmod +x /mnt/install2.sh
+arch-chroot /mnt ./install2.sh
+exit
+
+
+
+###part2
+
+
+
+#!/bin/bash
+
+# Setting things so things are faster
+pacman -S --noconfirm sed
+sed -i "s/^#ParallelDownloads = 5$/ParallelDownloads = 15/" /etc/pacman.conf
+
+makej=$(nproc)
+makel=$(expr "$(nproc)" + 1)
+sed -i "s/^#MAKEFLAGS=\"-j2\"$/MAKEFLAGS=\"-j$makej -l$makel\"/" /etc/makepkg.conf
+
+# Setting timezone stuff
+ln -sf /usr/share/zoneinfo/US/Mountain /etc/localtime
+hwclock --systohc
+
+# Setting language stuff
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "KEYMAP=us" > /etc/vconsole.conf
+
+# Setting hostname(PC Name)
 clear
+echo -ne "Enter your desired hostname(PCName): "
+read -r hostname
+echo "$hostname" > /etc/hostname
 
-# Check for AUR helper and install if not found
-ISAUR=$(command -v yay || command -v paru)
+echo "127.0.0.1      localhost" >> /etc/hosts
+echo "::1            localhost" >> /etc/hosts
+echo "127.0.1.1      $hostname.localdomain $hostname" >> /etc/hosts
 
-if [ -n "$ISAUR" ]; then
-    printf "\n%s - AUR helper was located, moving on.\n" "${OK}"
-else 
-    printf "\n%s - AUR helper was NOT located\n" "$WARN"
+# First making of initcpio
+mkinitcpio -P
 
-    while true; do
-        read -rp "${CAT} Which AUR helper do you want to use, yay or paru? Enter 'y' or 'p': " choice 
-        case "$choice" in
-            y|Y)
-                helper="yay"
-                break
-                ;;
-            p|P)
-                helper="paru"
-                break
-                ;;
-            *)
-                printf "%s - Invalid choice. Please enter 'y' or 'p'\n" "${ERROR}"
-                continue
-                ;;
-        esac
-    done
+# Installing systemd-boot instead of grub for speed
+bootctl install
 
-    printf "\n%s - Installing $helper from AUR\n" "${NOTE}"
-    git clone https://aur.archlinux.org/"$helper"-bin.git || { printf "%s - Failed to clone $helper from AUR\n" "${ERROR}"; exit 1; }
-    cd "$helper"-bin || { printf "%s - Failed to enter $helper-bin directory\n" "${ERROR}"; exit 1; }
-    makepkg -si --noconfirm 2>&1 | tee -a "$LOG" || { printf "%s - Failed to install $helper from AUR\n" "${ERROR}"; exit 1; }
-    cd ..
-fi
+# Systemd-boot pacman hook
+mkdir -p /etc/pacman.d/hooks
 
-# Clear the screen
+echo "[Trigger]" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "Type = Package" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "Operation = Upgrade" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "Target = systemd" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "[Action]" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "Description = Gracefully upgrading systemd-boot..." >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "When = PostTransaction" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+echo "Exec = /usr/bin/systemctl restart systemd-boot-update.service" >> /etc/pacman.d/hooks/100-systemd-boot.hook
+
+# Setting loader and entry files for systemd-boot
+mkdir -p /boot/loader/entries
+
+echo "timeout 0" >> /boot/loader/loader.conf
+echo "default arch" >> /boot/loader/loader.conf
+echo "editor 0" >> /boot/loader/loader.conf
+
 clear
+lsblk
+echo -ne "Enter root partition: "
+read -r rootpart
 
-# Update the system before proceeding
-printf "\n%s - Performing a full system update to avoid issues....\n" "${NOTE}"
+echo "title Arch Linux" >> /boot/loader/entries/arch.conf
+echo "linux /vmlinuz-linux" >> /boot/loader/entries/arch.conf
+echo "initrd /initramfs-linux.img" >> /boot/loader/entries/arch.conf
+echo "options root=$(blkid | grep $rootpart | awk '{print $2}' | sed 's/"//g') loglevel=3 audit=0 quiet rw" >> /boot/loader/entries/arch.conf
 
-# Recheck for the AUR helper as it may have been installed in the previous step
-ISAUR=$(command -v yay || command -v paru)
+# Installing everything I think I need
+pacman -S xorg-server xorg-xinit xorg-xkill xorg-xsetroot xorg-xbacklight xorg-xprop xorg-xrandr xorg-xinput \
+          dunst pavucontrol acpi lxappearance papirus-icon-theme arc-gtk-theme rofi \
+          zsh zsh-syntax-highlighting zsh-autosuggestions alacritty ranger nnn mpd playerctl mpc ncmpcpp nemo \
+          lolcat htop btop vim neovim nodejs libreoffice \
+          hunspell hunspell-en_us hyphen hyphen-en libmythes mythes-en feh firefox starship dust bat exa \
+          rclone rsync maim xdotool noto-fonts noto-fonts-emoji \
+          ttf-joypixels ttf-font-awesome imv mpv fzf gzip p7zip libzip zip unzip yt-dlp \
+          dhcpcd networkmanager network-manager-applet sudo man-db git base-devel  \
+          pipewire lib32-pipewire wireplumber pipewire-alsa pipewire-pulse pipewire-jack \
+          zathura zathura-pdf-mupdf ripgrep fd
 
-"$ISAUR" -Syu --noconfirm 2>&1 | tee -a "$LOG" || { printf "%s - Failed to update system\n" "${ERROR}"; exit 1; }
+systemctl enable NetworkManager.service
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-# Clear the screen
+# Settings up a user
 clear
+echo -ne "Enter username for new user: "
+read -r username
+useradd -m -g users -G wheel -s /bin/zsh "$username"
+passwd "$username"
 
-# Set the script to exit on error
-set -e
+# Setting up my dotfiles for that user
+sed '1,/^###part3$/d' install2.sh > /home/$username/installdots.sh
+chown $username:users /home/$username/installdots.sh
+chmod +x /home/$username/installdots.sh
+su -c /home/$username/installdots.sh -s /bin/bash $username
+exit
 
-# Exit immediately if a command exits with a non-zero status.
 
-# Loop through PKG1
-for PKG1 in dolphin dolphin-plugins kitty swaybg swaylock-effects aha wofi wlogout qt5-base mako grim slurp wl-clipboard polkit-kde-agent nwg-look-bin swww pipewire micro pipewire-alsa pavucontrol playerctl file-roller feh geany zip unzip unrar xarchiver p7zip geany-plugins ranger yt-dlp timidity mpd ncmpcpp ani-cli lobster-git maim; do
-    install_and_display_status "$PKG1" "PKG1"
-done
 
-# Loop through PKG2
-for PKG2 in wayland wayland-protocols qt-wayland qt6-wayland lds lxappearance-gtk3 aalib chezmoi dex dmidecode jp2a spyder jupyterlab tomlplusplus starship jq gvfs gvfs-mtp ffmpegthumbs mpv python-requests pamixer mpv-mpris brightnessctl xdg-user-dirs imv xdg-user-dirs-gtk mpv network-manager-applet cava rofi-emoji alacritty starship rofi gnome-keyring acpi zathura-pdf-mupdf zathura swaync ffmpegthumbnailer starship zsh ascii; do
-    install_and_display_status "$PKG2" "PKG2"
-done
+###part3
 
-# Loop through PKG3
-for PKG3 in lib32-libdecor lib32-libva lib32-wayland wlroots wl-clipboard cliphist cd ~/.config/hypr/themes clipman udisks2 udisks2-qt5 udiskie gdb ninja gcc cmake meson libxcb xcb-proto xcb-util xcb-util-keysyms libxfixes libx11 libxcomposite xorg-xinput libxrender pixman wlrobs-hg wrappedhl cairo pango seatd libxkbcommon xcb-util-wm xorg-xwayland libinput libliftoff libdisplay-info cpio; do
-    install_and_display_status "$PKG3" "PKG3"
-done
 
-# Set the script to exit on error
-set -e
 
-# Clear the screen
-clear
+#!/bin/bash
 
-# Check if ly is already installed
-if command -v ly >/dev/null; then
-    printf "${NOTE} ly is already installed.\n"
-elif command -v sddm >/dev/null; then
-    # If SDDM is installed, disable other login managers
-    for login_manager in lightdm gdm lxdm lxdm-gtk3; do
-        if pacman -Qs "$login_manager" > /dev/null; then
-            echo "Disabling $login_manager..."
-            sudo systemctl disable "$login_manager.service" 2>&1 | tee -a $LOG
-        fi
-    done
-    # Activate SDDM
-    printf "Activating SDDM service...\n"
-    sudo systemctl enable sddm
-else
-    printf "No login manager is installed.\n"
-fi
+cd $HOME
 
-# Prompt the user about which XDG-Portals to install
-printf "${CAT} Choose which XDG-Portals to install (separate choices with commas):\n"
-printf "  (g)nome - GNOME\n"
-printf "  (h)yprland - Hyprland\n"
-printf "  (k)de - KDE\n"
-printf "  (w)lr - WLR (Wayland Reference Implementation)\n"
-printf "  (l)xqt - LXQt\n"
-printf "  (gtk) - GTK (xdg-desktop-portal-gtk)\n"
-printf "  (n)one - Do not install any XDG-Portals\n"
+# My dotfiles
+git clone --separate-git-dir=$HOME/.dotfiles https://github.com/DoctorJax/.dotfiles.git tmpdotfiles
+rsync --recursive --verbose --exclude '.git' tmpdotfiles/ $HOME/
+rm -r tmpdotfiles
+/usr/bin/git --git-dir=$HOME/.dotfiles/ --work-tree=$HOME config --local status.showUntrackedFiles no
 
-read -p "Enter your choice(s): " XDG_CHOICES
+# Creating default directories
+mkdir -p Documents Downloads Pictures Music
 
-IFS=',' read -ra CHOICES <<< "$XDG_CHOICES"
+# DTs wallpapers
+git clone https://gitlab.com/dwt1/wallpapers.git
 
-for CHOICE in "${CHOICES[@]}"; do
-    case "$CHOICE" in
-        [Gg]*)
-            XDG_PACKAGE="xdg-desktop-portal-gnome"
-            XDG_NAME="GNOME"
-            ;;
-        [Hh]*)
-            XDG_PACKAGE="xdg-desktop-portal-hyprland"
-            XDG_NAME="Hyprland"
-            ;;
-        [Kk]*)
-            XDG_PACKAGE="xdg-desktop-portal-kde"
-            XDG_NAME="KDE"
-            ;;
-        [Ww]*)
-            XDG_PACKAGE="xdg-desktop-portal-wlr"
-            XDG_NAME="WLR (Wayland Reference Implementation)"
-            ;;
-        [Ll]*)
-            XDG_PACKAGE="xdg-desktop-portal-lxqt"
-            XDG_NAME="LXQt"
-            ;;
-        [Gg]*)
-            XDG_PACKAGE="xdg-desktop-portal-gtk"
-            XDG_NAME="GTK"
-            ;;
-        *)
-            XDG_PACKAGE=""
-            ;;
-    esac
+# Vim Plug
+sh -c 'curl -fLo "${XDG_DATA_HOME:-$HOME/.local/share}"/nvim/site/autoload/plug.vim --create-dirs \
+       https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim'
 
-    if [ -n "$XDG_PACKAGE" ]; then
-        printf "${NOTE} Installing $XDG_NAME XDG-Portal...\n"
+# Paru
+git clone https://aur.archlinux.org/paru.git
+cd paru
+makepkg -si
 
-        # Install the chosen XDG-Portal
-        install_package "$XDG_PACKAGE" 2>&1 | tee -a $LOG
+paru -S hyprland-git xdg-desktop-portal-hyprland-git eww-wayland waybar-hyprland-git emacs-gcc-wayland-devel-bin \
+        fastfetch-git pfetch xcursor-breeze brave-bin thunderbird nwg-look-bin grimblast-git anyrun-git \
+        swaync-git polkit-gnome prismlauncher-git nerd-fonts-complete
 
-        if [ $? -ne 0 ]; then
-            printf "\e[1A\e[K%s - $XDG_NAME XDG-Portal install had failed, please check the install.log\n" "${ERROR}"
-            exit 1
-        fi
-    else
-        printf "${NOTE} No XDG-Portal selected for installation.\n"
-    fi
-done
+# Doom Emacs
+git clone --depth 1 https://github.com/doomemacs/doomemacs ~/.emacs.d
+~/.emacs.d/bin/doom install
 
-# Disable WiFi powersave
-LOC="/etc/NetworkManager/conf.d/wifi-powersave.conf"
-if [ -f "$LOC" ]; then
-    printf "${OK} WiFi powersave is already disabled.\n"
-else
-    printf "${NOTE} Disabling WiFi powersave...\n"
-    printf "[connection]\nwifi.powersave = 2" | sudo tee -a $LOC
-    printf "\n"
-    printf "${NOTE} Restarting NetworkManager service...\n"
-    sudo systemctl restart NetworkManager 2>&1 | tee -a $LOG
-    sleep 2
-fi
-
-# Clear the screen
-clear
-
-# Copy Config Files
-set -e
-
-read -n1 -rep "${CAT} Would you like to copy config and wallpaper files? (y,n)" CFG
-if [[ $CFG =~ ^[Yy]$ ]]; then
-
-    # Check for existing config folders and backup
-    for DIR in btop cava hypr foot mako swaylock waybar wlogout wofi; do
-        DIRPATH=~/.config/$DIR
-        if [ -d "$DIRPATH" ]; then
-            echo -e "${NOTE} - Config for $DIR found, attempting to back up."
-            mv $DIRPATH $DIRPATH-back-up 2>&1 | tee -a $LOG
-            echo -e "${NOTE} - Backed up $DIR to $DIRPATH-back-up."
-        fi
-    done
-
-    printf "Copying config files...\n"
-    mkdir -p ~/.config
-    cp -r config/* ~/.config/ || { echo "Error: Failed to copy configs."; exit 1; } 2>&1 | tee -a $LOG
-    cp -r home/* ~/ || { echo "Error: Failed to copy configs."; exit 1; } 2>&1 | tee -a $LOG
-
-    # Set some files as executable
-    chmod +x ~/.config/hypr/scripts/* 2>&1 | tee -a "$LOG"
-else
-    print_error "No Config files and wallpaper files copied"
-fi
-
-# Clear the screen
-clear
-
-# Script is done
-printf "\n${OK} Installation Completed.\n\n"
-
-# Start Hyprland
-read -n1 -rep "${CAT} Would you like to start Hyprland now? (y,n)" HYP
-
-if [[ $HYP =~ ^[Yy]$ ]]; then
-    if command -v sddm >/dev/null; then
-        sudo systemctl start sddm 2>&1 | tee -a $LOG
-    fi
-
-    if command -v Hyprland >/dev/null; then
-        exec Hyprland
-    else
-        print_error "Hyprland not found. Please make sure Hyprland is installed by checking install.log.\n"
-        exit 1
-    fi
-else
-    exit
-fi
+exit
