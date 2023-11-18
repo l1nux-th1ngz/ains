@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Create the directory if it doesn't exist
-mkdir -p ~/.config/hypr/themes
+cd ~/.config/hypr/mkdir -p ~ Themes
 
 # Change to the themes directory
 cd ~/.config/hypr/themes
